@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import unicode_literals
 from __future__ import print_function
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import numpy as np
@@ -10,6 +11,7 @@ import os
 from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
 import time
 import argparse
+
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from modules.modeling import CLIP4Clip
@@ -17,10 +19,14 @@ from modules.optimization import BertAdam
 
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
+from torch.optim import AdamW
+from transformers import get_cosine_schedule_with_warmup
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 torch.distributed.init_process_group(backend="nccl")
 
 global logger
+
 
 def get_args(description='CLIP4Clip on Retrieval Task'):
     parser = argparse.ArgumentParser(description=description)
@@ -49,6 +55,11 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--hard_negative_rate', type=float, default=0.5, help='rate of intra negative sample')
     parser.add_argument('--negative_weighting', type=int, default=1, help='Weight the loss for intra negative')
     parser.add_argument('--n_pair', type=int, default=1, help='Num of pair to output from data loader')
+    
+    parser.add_argument("--use_window", action="store_true", help="Enable sliding window mean pooling")
+    parser.add_argument("--window_size", type=int, default=32, help="Number of frames per window")
+    parser.add_argument("--window_stride", type=int, default=16, help="Stride size between windows")
+
 
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
@@ -75,7 +86,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument("--datatype", default="msrvtt", type=str, help="Point the dataset to finetune.")
 
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
+    parser.add_argument("--local_rank", "--local-rank", default=0, type=int, help="distribted training")
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--coef_lr', type=float, default=1., help='coefficient for bert branch.')
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
@@ -103,6 +114,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
                         help="choice a similarity header.")
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
+    parser.add_argument("--start_epoch", type=int, default=0, help="Epoch offset for continuing training")
 
     args = parser.parse_args()
 
@@ -150,14 +162,18 @@ def set_seed_logger(args):
 
     return args
 
-def init_device(args, local_rank):
+def init_device(args):
     global logger
+    
+    local_rank = int(os.environ["LOCAL_RANK"])
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu", local_rank)
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(local_rank)
 
     n_gpu = torch.cuda.device_count()
     logger.info("device: {} n_gpu: {}".format(device, n_gpu))
     args.n_gpu = n_gpu
+    args.local_rank = local_rank
 
     if args.batch_size % args.n_gpu != 0 or args.batch_size_val % args.n_gpu != 0:
         raise ValueError("Invalid batch_size/batch_size_val and n_gpu parameter: {}%{} and {}%{}, should be == 0".format(
@@ -205,18 +221,21 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
         {'params': [p for n, p in no_decay_noclip_param_tp], 'weight_decay': 0.0}
     ]
 
-    scheduler = None
-    optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=args.warmup_proportion,
-                         schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
-                         t_total=num_train_optimization_steps, weight_decay=weight_decay,
-                         max_grad_norm=1.0)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=1e-6)
+    
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=20,        # restart
+        T_mult=1,     
+        eta_min=1e-7  # min learning rate
+    )
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                      output_device=local_rank, find_unused_parameters=True)
+                                                      output_device=local_rank, find_unused_parameters=False, broadcast_buffers=False)
 
     return optimizer, scheduler, model
 
-def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
+def save_model(epoch, args, model, optimizer, scheduler, tr_loss, type_name=""):
     # Only save the model it-self
     model_to_save = model.module if hasattr(model, 'module') else model
     output_model_file = os.path.join(
@@ -228,6 +247,7 @@ def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
             'epoch': epoch,
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': tr_loss,
+            'scheduler_state_dict': scheduler.state_dict(),
             }, optimizer_state_file)
     logger.info("Model saved to %s", output_model_file)
     logger.info("Optimizer saved to %s", optimizer_state_file)
@@ -249,7 +269,7 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
         model = None
     return model
 
-def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0):
+def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0, writer=None):
     global logger
     torch.cuda.empty_cache()
     model.train()
@@ -277,10 +297,12 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+
+            optimizer.step()
             if scheduler is not None:
                 scheduler.step()  # Update learning rate schedule
 
-            optimizer.step()
+            
             optimizer.zero_grad()
 
             # https://github.com/openai/CLIP/issues/46
@@ -290,15 +312,20 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                 torch.clamp_(model.clip.logit_scale.data, max=np.log(100))
 
             global_step += 1
+            current_lrs = [pg["lr"] for pg in optimizer.param_groups]
             if global_step % log_step == 0 and local_rank == 0:
                 logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
-                            len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
+                            len(train_dataloader),  "-".join([f"{lr:.9f}" for lr in sorted(set(current_lrs))]),
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
 
     total_loss = total_loss / len(train_dataloader)
+    if local_rank == 0 and writer is not None:
+        writer.add_scalar("train/loss", total_loss, epoch)
+        for i, param_group in enumerate(optimizer.param_groups):
+            writer.add_scalar(f"train/lr_group{i}", param_group["lr"], epoch)
     return total_loss, global_step
 
 def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list):
@@ -318,7 +345,7 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
         sim_matrix.append(each_row)
     return sim_matrix
 
-def eval_epoch(args, model, test_dataloader, device, n_gpu):
+def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch=None, writer=None):
 
     if hasattr(model, 'module'):
         model = model.module.to(device)
@@ -457,13 +484,17 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
 
     R1 = tv_metrics['R1']
+    if args.local_rank == 0 and writer is not None:
+        writer.add_scalar("val/R@1", tv_metrics['R1'], epoch)
+        writer.add_scalar("val/R@5", tv_metrics['R5'], epoch)
+        writer.add_scalar("val/R@10", tv_metrics['R10'], epoch)
     return R1
 
 def main():
     global logger
     args = get_args()
     args = set_seed_logger(args)
-    device, n_gpu = init_device(args, args.local_rank)
+    device, n_gpu = init_device(args)
 
     tokenizer = ClipTokenizer()
 
@@ -524,9 +555,12 @@ def main():
     # train and eval
     ## ####################################
     if args.do_train:
+        writer = None
+        if args.local_rank == 0:
+            writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs"))
         train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
-        num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
-                                        / args.gradient_accumulation_steps) * args.epochs
+        num_train_optimization_steps = ((len(train_dataloader) + args.gradient_accumulation_steps - 1)
+                                        // args.gradient_accumulation_steps) * args.epochs
 
         coef_lr = args.coef_lr
         optimizer, scheduler, model = prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, args.local_rank, coef_lr=coef_lr)
@@ -546,29 +580,38 @@ def main():
         if args.resume_model:
             checkpoint = torch.load(args.resume_model, map_location='cpu')
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            else:
+                print("Warning: checkpoint has no scheduler_state_dict. Initializing scheduler from scratch.")
             resumed_epoch = checkpoint['epoch']+1
             resumed_loss = checkpoint['loss']
+            
         
         global_step = 0
+        
+        
         for epoch in range(resumed_epoch, args.epochs):
+            real_epoch = epoch + args.start_epoch
             train_sampler.set_epoch(epoch)
-            tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
-                                               scheduler, global_step, local_rank=args.local_rank)
+            tr_loss, global_step = train_epoch(real_epoch, args, model, train_dataloader, device, n_gpu, optimizer,
+                                               scheduler, global_step, local_rank=args.local_rank, writer=writer)
             if args.local_rank == 0:
-                logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
+                logger.info("Epoch %d/%s Finished, Train Loss: %f", real_epoch + 1, args.epochs+args.start_epoch, tr_loss)
 
-                output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
+                output_model_file = save_model(real_epoch, args, model, optimizer, scheduler, tr_loss, type_name="")
 
                 ## Run on val dataset, this process is *TIME-consuming*.
                 # logger.info("Eval on val dataset")
                 # R1 = eval_epoch(args, model, val_dataloader, device, n_gpu)
 
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu)
+                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu, epoch=real_epoch, writer=writer)
                 if best_score <= R1:
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
-
+        if writer is not None:
+            writer.close()
         ## Uncomment if want to test on the best checkpoint
         # if args.local_rank == 0:
         #     model = load_model(-1, args, n_gpu, device, model_file=best_output_model_file)

@@ -86,11 +86,17 @@ class PretrainedConfig(object):
 
         if state_dict is None:
             weights_path = os.path.join(serialization_dir, cls.weights_name)
-            if os.path.exists(weights_path):
-                state_dict = torch.load(weights_path, map_location='cpu')
+            if os.path.exists(weights_path) and os.path.getsize(weights_path) > 0:
+                try:
+                    state_dict = torch.load(weights_path, map_location='cpu')
+                except Exception as e:
+                    if task_config is None or task_config.local_rank == 0:
+                        logger.warning(f"[cross-base] Failed to load {weights_path}: {e}. RANDOM init will be used.")
+                    state_dict = None  # 로딩 실패 → 랜덤 init
             else:
                 if task_config is None or task_config.local_rank == 0:
-                    logger.info("Weight doesn't exsits. {}".format(weights_path))
+                    logger.info(f"[cross-base] no Weight file, RANDOM init will be used. {weights_path}")
+                state_dict = None
 
         if tempdir:
             # Clean up temp dir

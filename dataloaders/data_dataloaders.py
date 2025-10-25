@@ -6,6 +6,7 @@ from dataloaders.dataloader_msvd_retrieval import MSVD_DataLoader
 from dataloaders.dataloader_lsmdc_retrieval import LSMDC_DataLoader
 from dataloaders.dataloader_activitynet_retrieval import ActivityNet_DataLoader
 from dataloaders.dataloader_didemo_retrieval import DiDeMo_DataLoader
+from .dataloader_custom import Custom_DataLoader
 
 def dataloader_msrvtt_train(args, tokenizer):
     msrvtt_dataset = MSRVTT_TrainDataLoader(
@@ -245,6 +246,70 @@ def dataloader_didemo_test(args, tokenizer, subset="test"):
         drop_last=False,
     )
     return dataloader_didemo, len(didemo_testset)
+    
+    
+def dataloader_custom_train(args, tokenizer):
+    from .dataloader_custom import Custom_DataLoader
+    dataset = Custom_DataLoader(
+        subset="train",
+        data_path=args.data_path,
+        features_path=args.features_path,
+        tokenizer=tokenizer,
+        max_words=args.max_words,
+        feature_framerate=args.feature_framerate,
+        max_frames=args.max_frames,
+        image_resolution=getattr(args, "image_resolution", 224),
+        frame_order=args.train_frame_order,
+        slice_framepos=args.slice_framepos,
+    )
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=4,
+        pin_memory=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        drop_last=True,
+    )
+    return loader, len(dataset), train_sampler
+
+
+def dataloader_custom_eval(args, tokenizer, subset="val"):
+    assert subset in ["val", "test"], "subset must be 'val' or 'test'"
+    from .dataloader_custom import Custom_DataLoader
+    dataset = Custom_DataLoader(
+        subset=subset,
+        data_path=args.data_path,
+        features_path=args.features_path,
+        tokenizer=tokenizer,
+        max_words=args.max_words,
+        feature_framerate=args.feature_framerate,
+        max_frames=args.max_frames,
+        image_resolution=getattr(args, "image_resolution", 224),
+        frame_order=args.eval_frame_order,
+        slice_framepos=args.slice_framepos,
+    )
+    from torch.utils.data.distributed import DistributedSampler
+
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=torch.distributed.get_world_size(),
+        rank=torch.distributed.get_rank(),
+        shuffle=False,
+        drop_last=True
+    )
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size_val,
+        num_workers=4,
+        pin_memory=True,
+        sampler=sampler
+    )
+    return loader, len(dataset)
+
+
 
 
 DATALOADER_DICT = {}
@@ -253,3 +318,4 @@ DATALOADER_DICT["msvd"] = {"train":dataloader_msvd_train, "val":dataloader_msvd_
 DATALOADER_DICT["lsmdc"] = {"train":dataloader_lsmdc_train, "val":dataloader_lsmdc_test, "test":dataloader_lsmdc_test}
 DATALOADER_DICT["activity"] = {"train":dataloader_activity_train, "val":dataloader_activity_test, "test":None}
 DATALOADER_DICT["didemo"] = {"train":dataloader_didemo_train, "val":dataloader_didemo_test, "test":dataloader_didemo_test}
+DATALOADER_DICT["custom"] = {"train": dataloader_custom_train, "val": dataloader_custom_eval, "test": dataloader_custom_eval}
