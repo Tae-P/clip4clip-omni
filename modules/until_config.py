@@ -92,7 +92,7 @@ class PretrainedConfig(object):
                 except Exception as e:
                     if task_config is None or task_config.local_rank == 0:
                         logger.warning(f"[cross-base] Failed to load {weights_path}: {e}. RANDOM init will be used.")
-                    state_dict = None  # 로딩 실패 → 랜덤 init
+                    state_dict = None  # if failed to load, random init
             else:
                 if task_config is None or task_config.local_rank == 0:
                     logger.info(f"[cross-base] no Weight file, RANDOM init will be used. {weights_path}")
